@@ -18,4 +18,9 @@ Needs git, rsync and Docker (classic builder; no buildx). Runs on Ubuntu 22.04 s
 - `babelfishpg_tds` is compiled with `-DHAVE_OPENSSL_INIT_SSL=1 -DHAVE_BIO_METH_NEW=1` (see Dockerfile): the
   sources still guard OpenSSL >= 1.1 APIs behind macros PostgreSQL 18's `pg_config.h` no longer defines.
 
+`patches/*.patch` are applied to the extensions before they are built. They fix incompatibilities between
+`babelfishpg_tds` and PostgreSQL 18 (currently: the TLS 1.2 cipher list used `ssl_tls13_ciphers`, so any
+`ssl=on` server died at startup). `pg0` additionally sets `ssl_groups=prime256v1` because the extension cannot parse
+PostgreSQL 18's default curve list. Both are candidates for upstream pull requests.
+
 After a release, copy the printed sha256 values into `pg0/versions.env`.

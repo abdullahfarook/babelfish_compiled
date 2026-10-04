@@ -36,6 +36,9 @@ RUN ./configure --prefix=${PREFIX} --with-ldap --with-libxml --with-pam --with-u
 
 # --- Babelfish extensions --------------------------------------------------
 COPY .src/ext/ /src/ext
+# Fixes for upstream incompatibilities with PostgreSQL 18 (see patches/*.patch).
+COPY patches/ /patches/
+RUN cd /src/ext && for p in /patches/*.patch; do patch -p1 --fuzz=0 < "$p" || exit 1; done
 ENV ANTLR4_JAVA_BIN=/usr/bin/java ANTLR_EXECUTABLE=/usr/local/lib/antlr-${ANTLR4_VERSION}-complete.jar \
     ANTLR4_RUNTIME_LIBRARIES=/usr/local/include/antlr4-runtime
 RUN test -x /usr/bin/java || { echo "java missing"; exit 1; }; cp /usr/local/lib/libantlr4-runtime.so.${ANTLR4_VERSION} ${PREFIX}/lib/ \
