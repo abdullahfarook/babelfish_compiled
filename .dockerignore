@@ -1,0 +1,6 @@
+*
+!babelfish_compiled/bundle.sh
+!babelfish_extensions
+!postgresql_modified_for_babelfish
+**/.git
+babelfish_extensions/test
