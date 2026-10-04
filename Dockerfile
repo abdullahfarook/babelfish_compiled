@@ -1,7 +1,7 @@
 # Builds the Babelfish PostgreSQL fork + extensions + ANTLR4 runtime + pgvector + pgbouncer
 # on Ubuntu 22.04 (glibc 2.35) so the result runs on every distro pg0 supports.
 #
-# Built by build.sh (classic builder, build context = parent directory).
+# Built by build.sh (classic builder). build.sh stages the sources into .src/{fork,ext}.
 FROM ubuntu:22.04 AS build
 ENV DEBIAN_FRONTEND=noninteractive
 ARG ANTLR4_VERSION=4.13.2
@@ -19,7 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ENV PREFIX=/opt/babelfish PG_CONFIG=/opt/babelfish/bin/pg_config
 
 # --- ANTLR4 C++ runtime ----------------------------------------------------
-COPY babelfish_extensions/contrib/babelfishpg_tsql/antlr/thirdparty/antlr/antlr-${ANTLR4_VERSION}-complete.jar /usr/local/lib/
+COPY .src/ext/contrib/babelfishpg_tsql/antlr/thirdparty/antlr/antlr-${ANTLR4_VERSION}-complete.jar /usr/local/lib/
 RUN curl -fsSL -o /tmp/antlr.zip https://www.antlr.org/download/antlr4-cpp-runtime-${ANTLR4_VERSION}-source.zip \
  && mkdir /tmp/antlr && unzip -q -d /tmp/antlr /tmp/antlr.zip && cd /tmp/antlr && mkdir build && cd build \
  && cmake .. -DANTLR_JAR_LOCATION=/usr/local/lib/antlr-${ANTLR4_VERSION}-complete.jar \
@@ -27,7 +27,7 @@ RUN curl -fsSL -o /tmp/antlr.zip https://www.antlr.org/download/antlr4-cpp-runti
  && make -j${JOBS} && make install && rm -rf /tmp/antlr /tmp/antlr.zip
 
 # --- Babelfish PostgreSQL fork --------------------------------------------
-COPY postgresql_modified_for_babelfish/ /src/pg
+COPY .src/fork/ /src/pg
 WORKDIR /src/pg
 RUN ./configure --prefix=${PREFIX} --with-ldap --with-libxml --with-pam --with-uuid=ossp \
       --enable-nls --with-libxslt --with-icu --with-openssl \
@@ -35,7 +35,7 @@ RUN ./configure --prefix=${PREFIX} --with-ldap --with-libxml --with-pam --with-u
  && make -C contrib -j${JOBS} && make -C contrib install
 
 # --- Babelfish extensions --------------------------------------------------
-COPY babelfish_extensions/ /src/ext
+COPY .src/ext/ /src/ext
 ENV ANTLR4_JAVA_BIN=/usr/bin/java ANTLR_EXECUTABLE=/usr/local/lib/antlr-${ANTLR4_VERSION}-complete.jar \
     ANTLR4_RUNTIME_LIBRARIES=/usr/local/include/antlr4-runtime
 RUN test -x /usr/bin/java || { echo "java missing"; exit 1; }; cp /usr/local/lib/libantlr4-runtime.so.${ANTLR4_VERSION} ${PREFIX}/lib/ \
@@ -57,7 +57,7 @@ RUN curl -fsSL https://www.pgbouncer.org/downloads/files/${PGBOUNCER_VERSION}/pg
  && make -j${JOBS} && make install
 
 # --- Relocatable bundle ----------------------------------------------------
-COPY babelfish_compiled/bundle.sh /usr/local/bin/bundle.sh
+COPY bundle.sh /usr/local/bin/bundle.sh
 ARG PGVECTOR_VERSION
 RUN PGVECTOR_VERSION=${PGVECTOR_VERSION} PGBOUNCER_VERSION=${PGBOUNCER_VERSION} bash /usr/local/bin/bundle.sh ${PREFIX} /out
 

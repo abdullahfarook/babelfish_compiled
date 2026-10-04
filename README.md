@@ -8,8 +8,9 @@ fork, `babelfishpg_{common,money,tds,tsql}`, ANTLR4 runtime, pgvector and pgboun
 ./build.sh linux/arm64     # QEMU smoke test only; release builds use a native arm64 runner
 ```
 
-Expects `../postgresql_modified_for_babelfish` and `../babelfish_extensions` (override with `FORK_DIR`/`EXT_DIR`).
-Needs Docker (classic builder; no buildx). Runs on Ubuntu 22.04 so binaries need at most glibc 2.35.
+Self-contained: `build.sh` clones the fork and extensions at the commits pinned in `versions.env` into `.src/`.
+To build from local checkouts instead: `FORK_DIR=... EXT_DIR=... ./build.sh`.
+Needs git, rsync and Docker (classic builder; no buildx). Runs on Ubuntu 22.04 so binaries need at most glibc 2.35.
 
 - `bundle.sh` makes the install relocatable: `$ORIGIN` RUNPATHs, non-glibc shared libs copied into `lib/`,
   hard links dereferenced, one top-level directory (pg0 strips it on extract).

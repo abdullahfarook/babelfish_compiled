@@ -23,32 +23,12 @@ jobs:
             platform: linux/arm64
     steps:
       - uses: actions/checkout@v4
-        with:
-          path: babelfish_compiled
-      - name: Load pins
-        id: pins
-        run: |
-          set -a; source babelfish_compiled/versions.env; set +a
-          for v in BABELFISH_PG_REPO BABELFISH_PG_REF BABELFISH_EXT_REPO BABELFISH_EXT_REF; do echo "$v=${!v}" >> $GITHUB_OUTPUT; done
-      - uses: actions/checkout@v4
-        with:
-          repository: ${{ steps.pins.outputs.BABELFISH_PG_REPO }}
-          ref: ${{ steps.pins.outputs.BABELFISH_PG_REF }}
-          path: postgresql_modified_for_babelfish
-      - uses: actions/checkout@v4
-        with:
-          repository: ${{ steps.pins.outputs.BABELFISH_EXT_REPO }}
-          ref: ${{ steps.pins.outputs.BABELFISH_EXT_REF }}
-          path: babelfish_extensions
       - name: Build bundle
-        run: |
-          # build.sh expects the three checkouts as siblings; the context is their parent dir.
-          cp babelfish_compiled/.dockerignore .dockerignore 2>/dev/null || true
-          ./babelfish_compiled/build.sh ${{ matrix.platform }}
+        run: ./build.sh ${{ matrix.platform }}   # clones the pinned fork + extensions commits
       - uses: actions/upload-artifact@v4
         with:
           name: bundle-${{ matrix.target }}
-          path: babelfish_compiled/out/*
+          path: out/*
 
   release:
     needs: build
