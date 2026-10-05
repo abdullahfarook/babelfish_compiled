@@ -1,0 +1,541 @@
+diff --git a/contrib/babelfishpg_tds/src/backend/tds/tdslogin.c b/contrib/babelfishpg_tds/src/backend/tds/tdslogin.c
+index cccca1266..91ad0f5a3 100644
+--- a/contrib/babelfishpg_tds/src/backend/tds/tdslogin.c
++++ b/contrib/babelfishpg_tds/src/backend/tds/tdslogin.c
+@@ -183,7 +183,13 @@ typedef struct LoginRequestData
+ 	/* the Active Directory (AD) domain name */
+ 	char	   *domainname;
+ 
+-	/* TODO: Feature data */
++	/*
++	 * LOGIN7 feature extension: absolute offset of the FeatureExt block (0 if
++	 * the client did not send one) and the VECTORSUPPORT version requested by
++	 * the client (0 if it did not ask for native vectors).
++	 */
++	uint32_t	featureExtOffset;
++	uint8_t		vectorSupportVersion;
+ 
+ } LoginRequestData;
+ 
+@@ -252,6 +258,13 @@ static void GetTDSVersionInstrumentation(uint32_t version);
+ #define LOGIN_OPTION_FLAGS3_UNKNOWN_COLLATION_HANDLING	0x08
+ #define LOGIN_OPTION_FLAGS3_EXTENSION			0x10
+ 
++/* LOGIN7 FeatureExt ids, see MS-TDS 2.2.7.6 */
++#define TDS_FEATURE_EXT_VECTORSUPPORT			0x0E
++#define TDS_FEATURE_EXT_TERMINATOR				0xFF
++#define TDS_TOKEN_FEATUREEXTACK					0xAE
++/* Highest vector feature version we implement (float32 vectors) */
++#define TDS_VECTOR_SUPPORT_VERSION				0x01
++
+ #define TEXT_SIZE_2GB 0x7FFFFFFF
+ #define TEXT_SIZE_INFINITE 0xFFFFFFFF
+ 
+@@ -869,7 +882,22 @@ FetchLoginRequest(LoginRequest request)
+ 
+ 			if (i == TDS_LOGIN_ATTR_UNUSED)
+ 			{
+-				if (TdsDiscardbytes(length))
++				/*
++				 * With fExtension set this slot is ibExtension/cbExtension
++				 * and points to a DWORD holding the offset of the FeatureExt
++				 * block.
++				 */
++				if ((request->optionFlags3 & LOGIN_OPTION_FLAGS3_EXTENSION) && length == sizeof(uint32_t))
++				{
++					if ((read + length) > request->length ||
++						TdsGetbytes((char *) &request->featureExtOffset, sizeof(uint32_t)))
++					{
++						pfree(temp_utf8.data);
++						pfree(buf.data);
++						return STATUS_ERROR;
++					}
++				}
++				else if (TdsDiscardbytes(length))
+ 				{
+ 					pfree(temp_utf8.data);
+ 					pfree(buf.data);
+@@ -1027,6 +1055,52 @@ FetchLoginRequest(LoginRequest request)
+ 		}
+ 	}
+ 
++	/*
++	 * Walk the FeatureExt block, if any.  Only VECTORSUPPORT is of interest;
++	 * every other feature is skipped (and not acknowledged).
++	 */
++	if (request->featureExtOffset >= read && request->featureExtOffset < request->length)
++	{
++		if (TdsDiscardbytes(request->featureExtOffset - read))
++			return STATUS_ERROR;
++		read = request->featureExtOffset;
++
++		while (read < request->length)
++		{
++			uint8_t		featureId;
++			uint32_t	featureLen;
++
++			if (TdsGetbytes((char *) &featureId, 1))
++				return STATUS_ERROR;
++			read += 1;
++
++			if (featureId == TDS_FEATURE_EXT_TERMINATOR)
++				break;
++
++			if (TdsGetbytes((char *) &featureLen, sizeof(featureLen)))
++				return STATUS_ERROR;
++			read += sizeof(featureLen);
++
++			if (featureLen > request->length - read)
++				return STATUS_ERROR;
++
++			if (featureId == TDS_FEATURE_EXT_VECTORSUPPORT && featureLen >= 1)
++			{
++				uint8_t		version;
++
++				if (TdsGetbytes((char *) &version, 1))
++					return STATUS_ERROR;
++				request->vectorSupportVersion = Min(version, TDS_VECTOR_SUPPORT_VERSION);
++				featureLen -= 1;
++				read += 1;
++			}
++
++			if (TdsDiscardbytes(featureLen))
++				return STATUS_ERROR;
++			read += featureLen;
++		}
++	}
++
+ 	/* Now, discard rest of the bytes, if any */
+ 	if (TdsDiscardbytes((size_t) (request->length - read)))
+ 		return STATUS_ERROR;
+@@ -2446,6 +2520,25 @@ TdsSendLoginAck(Port *port)
+ 
+ 		pfree(buf.data);
+ 
++		/*
++		 * Acknowledge the features we implement.  A client only gets native
++		 * vectors on the wire if it asked for VECTORSUPPORT and we say yes here.
++		 */
++		if (request->vectorSupportVersion > 0)
++		{
++			uint32_t	ackLen = 1;
++
++			temp8 = TDS_TOKEN_FEATUREEXTACK;
++			TdsPutbytes(&temp8, sizeof(temp8));
++			temp8 = TDS_FEATURE_EXT_VECTORSUPPORT;
++			TdsPutbytes(&temp8, sizeof(temp8));
++			TdsPutbytes(&ackLen, sizeof(ackLen));
++			temp8 = request->vectorSupportVersion;
++			TdsPutbytes(&temp8, sizeof(temp8));
++			temp8 = TDS_FEATURE_EXT_TERMINATOR;
++			TdsPutbytes(&temp8, sizeof(temp8));
++		}
++
+ 		/* Append the DONE message */
+ 		TdsSendDone(TDS_TOKEN_DONE, TDS_DONE_FINAL, 2, 0);
+ 
+@@ -2495,6 +2588,16 @@ GetClientTDSVersion(void)
+ 	return loginInfo->tdsVersion;
+ }
+ 
++/*
++ * TdsClientVectorSupport - true if the client negotiated native vector support
++ * (LOGIN7 FeatureExt VECTORSUPPORT) and may be sent TDS type 0xF5.
++ */
++bool
++TdsClientVectorSupport(void)
++{
++	return loginInfo != NULL && loginInfo->vectorSupportVersion > 0;
++}
++
+ /*
+  * This function will return the AD domain name.
+  */
+diff --git a/contrib/babelfishpg_tds/src/backend/tds/tdsresponse.c b/contrib/babelfishpg_tds/src/backend/tds/tdsresponse.c
+index 47edc0805..a18e3fc04 100644
+--- a/contrib/babelfishpg_tds/src/backend/tds/tdsresponse.c
++++ b/contrib/babelfishpg_tds/src/backend/tds/tdsresponse.c
+@@ -1376,7 +1376,26 @@ PrepareRowDescription(TupleDesc typeinfo, PlannedStmt *plannedstmt, List *target
+ 			case TDS_SEND_VARCHAR:
+ 				/* If this is one of the vector datatypes we should adjust the typmod. */
+ 				if (is_this_a_vector_datatype(col->pgTypeOid))
++				{
++					/*
++					 * Clients that negotiated VECTORSUPPORT get sys.vector as
++					 * the native TDS vector type; everybody else (and halfvec,
++					 * sparsevec) keeps getting the text form as varchar.  The
++					 * typmod of a vector column is its dimension count.
++					 */
++					if (col->pgTypeOid == sys_vector_oid && TdsClientVectorSupport())
++					{
++						int			maxBytes = 8000;
++
++						if (atttypmod > 0 && atttypmod < (8000 - 8) / 4)
++							maxBytes = 8 + 4 * atttypmod;
++
++						SetColMetadataForVectorType(col, maxBytes);
++						col->sendFunc = TdsSendTypeVector;
++						break;
++					}
+ 					atttypmod = -1;
++				}
+ 
+ 				SetColMetadataForCharTypeHelper(col, TDS_TYPE_VARCHAR,
+ 												att->attcollation, (atttypmod == -1) ?
+@@ -2378,6 +2397,7 @@ TdsPrintTup(TupleTableSlot *slot, DestReceiver *self)
+ 						case TDS_TYPE_CHAR:
+ 						case TDS_TYPE_NCHAR:
+ 						case TDS_TYPE_BINARY:
++						case TDS_TYPE_VECTOR:
+ 
+ 							/*
+ 							 * For these datatypes, we need to send 0xffff
+@@ -2498,6 +2518,7 @@ TdsPrintTup(TupleTableSlot *slot, DestReceiver *self)
+ 					case TDS_TYPE_CHAR:
+ 					case TDS_TYPE_NCHAR:
+ 					case TDS_TYPE_BINARY:
++					case TDS_TYPE_VECTOR:
+ 
+ 						/*
+ 						 * In case of TDS version lower than or equal to 7.3A,
+diff --git a/contrib/babelfishpg_tds/src/backend/tds/tdsrpc.c b/contrib/babelfishpg_tds/src/backend/tds/tdsrpc.c
+index da08acad0..2abc9744b 100644
+--- a/contrib/babelfishpg_tds/src/backend/tds/tdsrpc.c
++++ b/contrib/babelfishpg_tds/src/backend/tds/tdsrpc.c
+@@ -1777,6 +1777,43 @@ ReadParameters(TDSRequestSP request, uint64_t offset, StringInfo message, int *p
+ 					}
+ 				}
+ 				break;
++			case TDS_TYPE_VECTOR:
++				{
++					/*
++					 * Native vector parameter: USHORT max byte length, BYTE
++					 * element type (the "scale"), then a USHORT length and
++					 * the 8 byte vector header plus elements.
++					 */
++					uint16		maxLen;
++					uint16		len;
++
++					CheckMessageBounds(offset, sizeof(maxLen) + 1, message->len);
++					memcpy(&maxLen, &message->data[offset], sizeof(maxLen));
++					offset += sizeof(maxLen);
++					offset += 1;	/* element type, validated when the value is decoded */
++					temp->maxLen = maxLen;
++
++					SetColMetadataForBinaryType(&temp->paramMeta, tdsType, temp->maxLen);
++
++					CheckMessageBounds(offset, sizeof(len), message->len);
++					memcpy(&len, &message->data[offset], sizeof(len));
++					offset += sizeof(len);
++					temp->len = len;
++
++					/* NULL is a length of 0xFFFF */
++					if (temp->len == 0xffff)
++					{
++						temp->len = 0;
++						temp->isNull = true;
++					}
++
++					CheckForInvalidLength(temp);
++
++					temp->dataOffset = offset;
++					CheckMessageBounds(offset, temp->len, message->len);
++					offset += temp->len;
++				}
++				break;
+ 			case TDS_TYPE_DATE:
+ 				{
+ 					CheckMessageBounds(offset, 1, message->len);
+diff --git a/contrib/babelfishpg_tds/src/backend/tds/tdstypeio.c b/contrib/babelfishpg_tds/src/backend/tds/tdstypeio.c
+index 4589c0a63..953777a63 100644
+--- a/contrib/babelfishpg_tds/src/backend/tds/tdstypeio.c
++++ b/contrib/babelfishpg_tds/src/backend/tds/tdstypeio.c
+@@ -15,6 +15,7 @@
+  */
+ 
+ #include "postgres.h"
++#include <math.h>
+ #include "varatt.h"
+ 
+ #include "access/htup_details.h"
+@@ -217,6 +218,8 @@ getSendFunc(int funcId)
+ 			return TdsSendTypeGeometry;
+ 		case TDS_SEND_GEOGRAPHY:
+ 			return TdsSendTypeGeography;
++		case TDS_SEND_VECTOR:
++			return TdsSendTypeVector;
+ 			/* TODO: should Assert here once all types are implemented */
+ 		default:
+ 			return NULL;
+@@ -296,6 +299,8 @@ getRecvFunc(int funcId)
+ 			return TdsRecvTypeGeometry;
+ 		case TDS_RECV_GEOGRAPHY:
+ 			return TdsRecvTypeGeography;
++		case TDS_RECV_VECTOR:
++			return TdsRecvTypeVector;
+ 			/* TODO: should Assert here once all types are implemented */
+ 		default:
+ 			return NULL;
+@@ -605,6 +610,41 @@ TdsLoadTypeFunctionCache(void)
+ 		}
+ 	}
+ 
++	{
++		/*
++		 * Native vector parameters (TDS type 0xF5) are received as sys.vector.
++		 * The type only exists once pgvector has been installed into sys, so
++		 * it cannot be part of the static map, whose entry for sys.vector
++		 * sends varchar to clients that did not negotiate VECTORSUPPORT.
++		 */
++		Oid			vectorOid = GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid,
++												CStringGetDatum("vector"), ObjectIdGetDatum(sys_nspoid));
++
++		if (OidIsValid(vectorOid))
++		{
++			FunctionCacheByTdsIdKey fc2key_vec;
++			FunctionCacheByTdsIdEntry *fc2ent_vec;
++			TdsIoFunctionInfo finfo_vec;
++
++			fc2key_vec.tdstypeid = TDS_TYPE_VECTOR;
++			fc2key_vec.tdstypelen = -1;
++			fc2ent_vec = (FunctionCacheByTdsIdEntry *) hash_search(functionInfoCacheByTdsId,
++																   &fc2key_vec,
++																   HASH_ENTER,
++																   NULL);
++			finfo_vec = &(fc2ent_vec->data);
++			finfo_vec->ttmtypeid = vectorOid;
++			finfo_vec->ttmbasetypeid = vectorOid;
++			finfo_vec->ttmtdstypeid = TDS_TYPE_VECTOR;
++			finfo_vec->ttmtdstypelen = -1;
++			finfo_vec->ttmtdslenbytes = 2;
++			finfo_vec->sendFuncId = TDS_SEND_VECTOR;
++			finfo_vec->sendFuncPtr = getSendFunc(TDS_SEND_VECTOR);
++			finfo_vec->recvFuncId = TDS_RECV_VECTOR;
++			finfo_vec->recvFuncPtr = getRecvFunc(TDS_RECV_VECTOR);
++		}
++	}
++
+ 	{
+ 		/*
+ 		 * Load Table Valued Paramerter since we can't have a static oid
+@@ -2804,6 +2844,112 @@ TdsSendTypeChar(FmgrInfo *finfo, Datum value, void *vMetaData)
+ 	return rc;
+ }
+ 
++/*
++ * pgvector's in-memory layout of sys.vector (a varlena).  Kept local so the TDS
++ * extension does not need pgvector's headers.
++ */
++typedef struct PgVectorData
++{
++	int32		vl_len_;
++	int16		dim;
++	int16		unused;
++	float		x[FLEXIBLE_ARRAY_MEMBER];
++} PgVectorData;
++
++/* MS-TDS 2.2.5.5.7: vector header = magic, version, dimension count, element type, 3 reserved bytes */
++#define TDS_VECTOR_HEADER_SIZE		8
++#define TDS_VECTOR_MAGIC			0xA9
++#define TDS_VECTOR_LAYOUT_VERSION	0x01
++#define TDS_VECTOR_ELEMENT_FLOAT32	0x00
++#define TDS_VECTOR_MAX_BYTES		8000
++
++/* --------------------------------
++ * TdsSendTypeVector - sends a sys.vector value as native TDS VECTOR (float32)
++ * --------------------------------
++ */
++int
++TdsSendTypeVector(FmgrInfo *finfo, Datum value, void *vMetaData)
++{
++	PgVectorData *vec = (PgVectorData *) PG_DETOAST_DATUM(value);
++	int			dim = vec->dim;
++	int			len = TDS_VECTOR_HEADER_SIZE + dim * (int) sizeof(float);
++	uint8_t		header[TDS_VECTOR_HEADER_SIZE];
++	int			rc;
++
++	if (len > TDS_VECTOR_MAX_BYTES)
++		ereport(ERROR,
++				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
++				 errmsg("vector with %d dimensions is too large for the TDS vector type (maximum is %d)",
++						dim, (TDS_VECTOR_MAX_BYTES - TDS_VECTOR_HEADER_SIZE) / (int) sizeof(float))));
++
++	header[0] = TDS_VECTOR_MAGIC;
++	header[1] = TDS_VECTOR_LAYOUT_VERSION;
++	header[2] = (uint8_t) (dim & 0xFF);
++	header[3] = (uint8_t) ((dim >> 8) & 0xFF);
++	header[4] = TDS_VECTOR_ELEMENT_FLOAT32;
++	header[5] = header[6] = header[7] = 0;
++
++	if ((rc = TdsPutInt16LE(len)) == 0 &&
++		(rc = TdsPutbytes(header, sizeof(header))) == 0)
++		rc = TdsPutbytes(vec->x, dim * (int) sizeof(float));	/* little-endian host only */
++
++	if ((Pointer) vec != DatumGetPointer(value))
++		pfree(vec);
++	return rc;
++}
++
++/* --------------------------------
++ * TdsRecvTypeVector - converts a native TDS VECTOR parameter to sys.vector
++ * --------------------------------
++ */
++Datum
++TdsRecvTypeVector(const char *message, const ParameterToken token)
++{
++	const unsigned char *data = (const unsigned char *) message + token->dataOffset;
++	int			len = token->len;
++	int			dim;
++	PgVectorData *result;
++
++	if (len < TDS_VECTOR_HEADER_SIZE ||
++		data[0] != TDS_VECTOR_MAGIC ||
++		data[1] != TDS_VECTOR_LAYOUT_VERSION)
++		ereport(ERROR,
++				(errcode(ERRCODE_PROTOCOL_VIOLATION),
++				 errmsg("The incoming tabular data stream (TDS) remote procedure call (RPC) protocol stream is incorrect. "
++						"Parameter %d (\"%s\"): invalid vector header.",
++						token->paramOrdinal + 1, token->paramMeta.colName.data)));
++
++	if (data[4] != TDS_VECTOR_ELEMENT_FLOAT32)
++		ereport(ERROR,
++				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++				 errmsg("Only float32 vectors are supported (parameter %d, \"%s\")",
++						token->paramOrdinal + 1, token->paramMeta.colName.data)));
++
++	dim = data[2] | (data[3] << 8);
++	if (dim < 1 || len != TDS_VECTOR_HEADER_SIZE + dim * (int) sizeof(float))
++		ereport(ERROR,
++				(errcode(ERRCODE_PROTOCOL_VIOLATION),
++				 errmsg("The incoming tabular data stream (TDS) remote procedure call (RPC) protocol stream is incorrect. "
++						"Parameter %d (\"%s\"): vector length does not match its dimension count.",
++						token->paramOrdinal + 1, token->paramMeta.colName.data)));
++
++	result = (PgVectorData *) palloc0(offsetof(PgVectorData, x) + sizeof(float) * dim);
++	SET_VARSIZE(result, offsetof(PgVectorData, x) + sizeof(float) * dim);
++	result->dim = (int16) dim;
++	memcpy(result->x, data + TDS_VECTOR_HEADER_SIZE, sizeof(float) * dim);
++
++	/* pgvector does not allow NaN or infinity either */
++	for (int i = 0; i < dim; i++)
++	{
++		if (isnan(result->x[i]) || isinf(result->x[i]))
++			ereport(ERROR,
++					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++					 errmsg("NaN and infinity are not allowed in vectors")));
++	}
++
++	return PointerGetDatum(result);
++}
++
+ int
+ TdsSendTypeVarbinary(FmgrInfo *finfo, Datum value, void *vMetaData)
+ {
+diff --git a/contrib/babelfishpg_tds/src/include/tds_int.h b/contrib/babelfishpg_tds/src/include/tds_int.h
+index d613346bf..7100dd3b7 100644
+--- a/contrib/babelfishpg_tds/src/include/tds_int.h
++++ b/contrib/babelfishpg_tds/src/include/tds_int.h
+@@ -303,6 +303,7 @@ extern void TdsSetBufferSize(uint32_t newSize);
+ extern int	TdsProcessLogin(Port *port, bool LoadSsl);
+ extern void TdsSendLoginAck(Port *port);
+ extern uint32_t GetClientTDSVersion(void);
++extern bool TdsClientVectorSupport(void);
+ extern char *get_tds_login_domainname(void);
+ extern void TdsSetDbContext(void);
+ extern void TdsResetLoginFlags(void);
+diff --git a/contrib/babelfishpg_tds/src/include/tds_iofuncmap.h b/contrib/babelfishpg_tds/src/include/tds_iofuncmap.h
+index 5726cddc6..70dca1a12 100644
+--- a/contrib/babelfishpg_tds/src/include/tds_iofuncmap.h
++++ b/contrib/babelfishpg_tds/src/include/tds_iofuncmap.h
+@@ -51,6 +51,7 @@
+ #define		TDS_SEND_DATETIMEOFFSET				29
+ #define		TDS_SEND_GEOMETRY				30
+ #define		TDS_SEND_GEOGRAPHY				31
++#define		TDS_SEND_VECTOR					32
+ 
+ #define		TDS_RECV_INVALID				0
+ #define		TDS_RECV_BIT					1
+@@ -84,6 +85,7 @@
+ #define		TDS_RECV_DATETIMEOFFSET				29
+ #define		TDS_RECV_GEOMETRY				30
+ #define		TDS_RECV_GEOGRAPHY				31
++#define		TDS_RECV_VECTOR					32
+ 
+ /*
+  * Supported TDS data types
+@@ -120,6 +122,7 @@
+ #define TDS_TYPE_CLRUDT         240 /* 0xF0 */
+ #define TDS_TYPE_GEOMETRY       254 /* 0xFE */
+ #define TDS_TYPE_GEOGRAPHY      255 /* 0xFF */
++#define TDS_TYPE_VECTOR			245 /* 0xF5 */
+ 
+ /*
+  * macros for supporting sqlvariant datatype on TDS side
+diff --git a/contrib/babelfishpg_tds/src/include/tds_request.h b/contrib/babelfishpg_tds/src/include/tds_request.h
+index fcd3c3156..c65e48c07 100644
+--- a/contrib/babelfishpg_tds/src/include/tds_request.h
++++ b/contrib/babelfishpg_tds/src/include/tds_request.h
+@@ -875,6 +875,18 @@ SetColMetadataForBinaryType(TdsColumnMetaData *col, uint8_t tdsType, uint16_t ma
+ 	col->metaEntry.type7.maxSize = maxSize;
+ }
+ 
++/* Native TDS VECTOR (0xF5): maxSize counts the 8 byte header, "scale" is the element type (0 = float32) */
++static inline void
++SetColMetadataForVectorType(TdsColumnMetaData *col, uint16_t maxSize)
++{
++	col->sizeLen = 2;
++	col->metaLen = sizeof(col->metaEntry.type9);
++	col->metaEntry.type9.flags = TDS_COL_METADATA_DEFAULT_FLAGS;
++	col->metaEntry.type9.tdsTypeId = TDS_TYPE_VECTOR;
++	col->metaEntry.type9.maxSize = maxSize;
++	col->metaEntry.type9.elementType = 0;
++}
++
+ static inline void
+ SetColMetadataForTimeType(TdsColumnMetaData *col, uint8_t tdsType, uint8_t scale)
+ {
+diff --git a/contrib/babelfishpg_tds/src/include/tds_typeio.h b/contrib/babelfishpg_tds/src/include/tds_typeio.h
+index da293399b..164d1d9bf 100644
+--- a/contrib/babelfishpg_tds/src/include/tds_typeio.h
++++ b/contrib/babelfishpg_tds/src/include/tds_typeio.h
+@@ -127,6 +127,16 @@ ColMetaEntry8
+ 	uint32_t	maxSize;
+ } ColMetaEntry8;
+ 
++/* COLMETADATA entry for type VECTOR: maxSize is bytes incl. the 8 byte header, elementType is the "scale" byte */
++typedef struct __attribute__ ((packed))
++ColMetaEntry9
++{
++	uint16_t	flags;
++	uint8_t		tdsTypeId;
++	uint16_t	maxSize;
++	uint8_t		elementType;
++} ColMetaEntry9;
++
+ typedef union ColMetaEntry
+ {
+ 	ColMetaEntry1 type1;
+@@ -137,6 +147,7 @@ typedef union ColMetaEntry
+ 	ColMetaEntry6 type6;
+ 	ColMetaEntry7 type7;
+ 	ColMetaEntry8 type8;
++	ColMetaEntry9 type9;
+ } ColMetaEntry;
+ 
+ /*
+@@ -417,6 +428,7 @@ extern int	TdsSendTypeBigint(FmgrInfo *finfo, Datum value, void *vMetaData);
+ extern int	TdsSendTypeFloat4(FmgrInfo *finfo, Datum value, void *vMetaData);
+ extern int	TdsSendTypeFloat8(FmgrInfo *finfo, Datum value, void *vMetaData);
+ extern int	TdsSendTypeVarchar(FmgrInfo *finfo, Datum value, void *vMetaData);
++extern int	TdsSendTypeVector(FmgrInfo *finfo, Datum value, void *vMetaData);
+ extern int	TdsSendTypeNVarchar(FmgrInfo *finfo, Datum value, void *vMetaData);
+ extern int	TdsSendTypeMoney(FmgrInfo *finfo, Datum value, void *vMetaData);
+ extern int	TdsSendTypeSmallmoney(FmgrInfo *finfo, Datum value, void *vMetaData);
+@@ -450,6 +462,7 @@ extern Datum TdsRecvTypeBigInt(const char *, const ParameterToken);
+ extern Datum TdsRecvTypeFloat4(const char *, const ParameterToken);
+ extern Datum TdsRecvTypeFloat8(const char *, const ParameterToken);
+ extern Datum TdsRecvTypeVarchar(const char *, const ParameterToken);
++extern Datum TdsRecvTypeVector(const char *, const ParameterToken);
+ extern Datum TdsRecvTypeNVarchar(const char *, const ParameterToken);
+ extern Datum TdsRecvTypeMoney(const char *, const ParameterToken);
+ extern Datum TdsRecvTypeSmallmoney(const char *, const ParameterToken);

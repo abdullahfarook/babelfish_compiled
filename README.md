@@ -23,4 +23,10 @@ Needs git, rsync and Docker (classic builder; no buildx). Runs on Ubuntu 22.04 s
 `ssl=on` server died at startup). `pg0` additionally sets `ssl_groups=prime256v1` because the extension cannot parse
 PostgreSQL 18's default curve list. Both are candidates for upstream pull requests.
 
+`patches/0002-tsql-merge-output.patch` adds `MERGE ... OUTPUT` (result-set form, as EF Core emits for batched inserts).
+`patches/0003-tds-native-vector-type.patch` adds SQL Server 2025's native `vector` TDS type (0xF5) to `babelfishpg_tds`:
+it parses the LOGIN7 feature extension and acknowledges VECTORSUPPORT, decodes vector RPC parameters and sends
+`sys.vector` columns as binary, only to clients that negotiated it (everyone else keeps getting varchar).
+Tests: `tests/merge_output_test.py`, `tests/vector_tsql_test.py`, `tests/sqlclient-vector/`, `tests/efcore-vector/`, `tests/efcore-shop/`.
+
 After a release, copy the printed sha256 values into `pg0/versions.env`.
