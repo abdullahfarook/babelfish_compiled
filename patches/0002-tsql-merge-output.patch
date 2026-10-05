@@ -1,0 +1,231 @@
+tsql: support MERGE ... OUTPUT (result-set form)
+
+Builds on babelfishpg_tsql.enable_tsql_merge (#4928, #4982). Adds the OUTPUT clause for MERGE,
+which is what Entity Framework Core's SQL Server provider emits for batched inserts:
+
+    MERGE [T] USING (VALUES ...) AS i ([c], _Position) ON 1=0
+    WHEN NOT MATCHED THEN INSERT ([c]) VALUES (i.[c]) OUTPUT INSERTED.[Id], i._Position;
+
+PostgreSQL 18 already has MERGE ... RETURNING with old / new row references and merge_action(),
+so the OUTPUT list becomes the RETURNING list:
+
+  - backend grammar: new tsql_MergeOutputStmt (MERGE ... tsql_output_clause) producing a MergeStmt
+    with a returningClause; inserted.<c> / deleted.<c> are renamed to new.<c> / old.<c>
+    (NULL for the missing side of an INSERT / DELETE action, as in SQL Server). No engine change.
+  - ANTLR layer: $action => merge_action(). The OUTPUT keyword and the pseudo-tables are left as
+    T-SQL because the rewritten text is parsed by ANTLR a second time (e.g. CREATE PROCEDURE
+    bodies), so every rewrite has to stay valid T-SQL.
+  - executor: report CMD_MERGE with RETURNING (SPI_OK_MERGE_RETURNING) like the other DML forms.
+  - OUTPUT ... INTO stays unsupported, now with its own message ("MERGE with OUTPUT INTO").
+
+Known differences from SQL Server: @@ROWCOUNT is 0 after any DML that returns OUTPUT rows (as for
+INSERT/UPDATE/DELETE ... OUTPUT in Babelfish today); TOP in MERGE is still unsupported.
+
+--- a/contrib/babelfishpg_tsql/src/pl_exec.c
++++ b/contrib/babelfishpg_tsql/src/pl_exec.c
+@@ -4807,6 +4807,7 @@
+ 			case SPI_OK_INSERT_RETURNING:
+ 			case SPI_OK_UPDATE_RETURNING:
+ 			case SPI_OK_DELETE_RETURNING:
++			case SPI_OK_MERGE_RETURNING:
+ 				Assert(stmt->mod_stmt);
+ 				exec_set_found(estate, (SPI_processed != 0));
+ 				break;
+@@ -5710,6 +5711,7 @@
+ 		case SPI_OK_INSERT_RETURNING:
+ 		case SPI_OK_UPDATE_RETURNING:
+ 		case SPI_OK_DELETE_RETURNING:
++		case SPI_OK_MERGE_RETURNING:
+ 		case SPI_OK_UTILITY:
+ 		case SPI_OK_REWRITTEN:
+ 			break;
+--- a/contrib/babelfishpg_tsql/src/pl_exec-2.c
++++ b/contrib/babelfishpg_tsql/src/pl_exec-2.c
+@@ -832,6 +832,8 @@
+ 			rc = SPI_OK_DELETE_RETURNING;
+ 		else if (cmd == CMD_UPDATE)
+ 			rc = SPI_OK_UPDATE_RETURNING;
++		else if (cmd == CMD_MERGE)
++			rc = SPI_OK_MERGE_RETURNING;
+ 	}
+ 
+ 	receiver->rDestroy(receiver);
+--- a/contrib/babelfishpg_tsql/src/tsqlUnsupportedFeatureHandler.cpp
++++ b/contrib/babelfishpg_tsql/src/tsqlUnsupportedFeatureHandler.cpp
+@@ -153,8 +153,8 @@
+ 				throw PGErrorWrapperException(ERROR, ERRCODE_SYNTAX_ERROR, "A MERGE statement must be terminated by a semi-colon (;).", getLineAndPos(ctx));
+ 			if (ctx->TOP())
+ 				handle(INSTR_UNSUPPORTED_TSQL_MERGE, "MERGE with TOP", getLineAndPos(ctx));
+-			if (ctx->output_clause())
+-				handle(INSTR_UNSUPPORTED_TSQL_MERGE, "MERGE with OUTPUT", getLineAndPos(ctx->output_clause()));
++			if (ctx->output_clause() && ctx->output_clause()->INTO())
++				handle(INSTR_UNSUPPORTED_TSQL_MERGE, "MERGE with OUTPUT INTO", getLineAndPos(ctx->output_clause()));
+ 			return visitChildren(ctx);
+ 		}
+ 		antlrcpp::Any visitBulk_insert_statement(TSqlParser::Bulk_insert_statementContext *ctx) override;
+--- a/contrib/babelfishpg_tsql/src/tsqlIface.cpp
++++ b/contrib/babelfishpg_tsql/src/tsqlIface.cpp
+@@ -155,6 +155,7 @@
+ static void process_execsql_destination(TSqlParser::Dml_statementContext *ctx, PLtsql_stmt_execsql *stmt);
+ static void process_execsql_remove_unsupported_tokens(TSqlParser::Dml_statementContext *ctx, PLtsql_expr_query_mutator *exprMutator);
+ static void post_process_merge_statement(TSqlParser::Merge_statementContext *mctx, PLtsql_expr *sqlstmt, PLtsql_expr_query_mutator *exprMutator);
++static void rewrite_merge_output_refs(antlr4::tree::ParseTree *node);
+ static bool post_process_create_table(TSqlParser::Create_tableContext *ctx, PLtsql_stmt_execsql *stmt, TSqlParser::Ddl_statementContext *baseCtx);
+ static bool post_process_alter_table(TSqlParser::Alter_tableContext *ctx, PLtsql_stmt_execsql *stmt, TSqlParser::Ddl_statementContext *baseCtx);
+ static bool post_process_create_index(TSqlParser::Create_indexContext *ctx, PLtsql_stmt_execsql *stmt, TSqlParser::Ddl_statementContext *baseCtx);
+@@ -8887,6 +8888,29 @@
+ }
+ 
+ /*
++ * Rewrite $action in a T-SQL MERGE OUTPUT clause into merge_action(), which returns
++ * 'INSERT' / 'UPDATE' / 'DELETE' just like $action does.
++ *
++ * Only $action is rewritten here. The OUTPUT keyword and the inserted / deleted pseudo-tables are
++ * left as T-SQL and resolved by the backend grammar (tsql_MergeOutputStmt), because the text
++ * produced by this pass is parsed by ANTLR again, e.g. for the body of a CREATE PROCEDURE, so it
++ * must remain valid T-SQL. merge_action() is an ordinary function call to that second pass.
++ */
++static void
++rewrite_merge_output_refs(antlr4::tree::ParseTree *node)
++{
++	if (auto *tn = dynamic_cast<antlr4::tree::TerminalNode *>(node))
++	{
++		if (tn->getSymbol()->getType() == TSqlParser::DOLLAR_ACTION)
++			rewritten_query_fragment.emplace(std::make_pair(tn->getSymbol()->getStartIndex(),
++				std::make_pair(tn->getText(), std::string("merge_action()"))));
++		return;
++	}
++	for (auto child : node->children)
++		rewrite_merge_output_refs(child);
++}
++
++/*
+  * Rewrite T-SQL MERGE into PostgreSQL MERGE syntax:
+  *   - MERGE <target>           => MERGE INTO <target>
+  *   - SET <alias>.<col> = ...  => SET <col> = ...
+@@ -8901,6 +8925,10 @@
+ 		rewritten_query_fragment.emplace(std::make_pair(mctx->MERGE()->getSymbol()->getStartIndex(),
+ 			std::make_pair(::getFullText(mctx->MERGE()), ::getFullText(mctx->MERGE()) + " INTO")));
+ 
++	/* OUTPUT ... INTO is rejected earlier (unsupported feature handler); only the result-set form is supported */
++	if (mctx->output_clause() && !mctx->output_clause()->INTO())
++		rewrite_merge_output_refs(mctx->output_clause());
++
+ 	for (auto wctx : mctx->when_matches())
+ 	{
+ 		if (wctx->merge_matched() && wctx->merge_matched()->UPDATE())
+--- a/contrib/babelfishpg_tsql/src/backend_parser/gram-tsql-decl.y
++++ b/contrib/babelfishpg_tsql/src/backend_parser/gram-tsql-decl.y
+@@ -17,7 +17,7 @@
+ %type <node> tsql_AlterFunctionStmt tsql_CreatePartitionStmt tsql_AlterViewStmt
+ %type <node> tsql_CreateFunctionStmt tsql_VariableSetStmt tsql_CreateTrigStmt tsql_TransactionStmt tsql_UpdateStmt tsql_DeleteStmt tsql_IndexStmt
+ %type <partspec> tsql_PartitionSpec
+-%type <node> tsql_DropIndexStmt tsql_InsertStmt
++%type <node> tsql_DropIndexStmt tsql_InsertStmt tsql_MergeOutputStmt
+ %type <str> tsql_DropIndexStmtSchema
+ %type <node> tsql_CreateLoginStmt tsql_AlterLoginStmt tsql_DropLoginStmt
+ %type <node> tsql_CreateUserStmt tsql_DropRoleStmt tsql_AlterUserStmt
+--- a/contrib/babelfishpg_tsql/src/backend_parser/gram-tsql-rule.y
++++ b/contrib/babelfishpg_tsql/src/backend_parser/gram-tsql-rule.y
+@@ -2587,6 +2587,32 @@
+ 				}
+ 		;
+ 
++/*
++ * T-SQL MERGE ... OUTPUT. PostgreSQL 18 has MERGE ... RETURNING, so the OUTPUT list becomes the
++ * RETURNING list; tsql_merge_output_to_returning() maps inserted / deleted onto the new / old
++ * row of each merge action. OUTPUT ... INTO is not supported.
++ */
++tsql_MergeOutputStmt:
++			opt_with_clause MERGE INTO relation_expr_opt_alias
++			USING table_ref
++			ON a_expr
++			merge_when_list
++			tsql_output_clause
++				{
++					MergeStmt  *m = makeNode(MergeStmt);
++
++					m->withClause = $1;
++					m->relation = $4;
++					m->sourceRelation = $6;
++					m->joinCondition = $8;
++					m->mergeWhenClauses = $9;
++					m->returningClause = (ReturningClause *) $10;
++					tsql_merge_output_to_returning(m->returningClause);
++
++					$$ = (Node *) m;
++				}
++		;
++
+ tsql_output_clause:
+ 				TSQL_OUTPUT tsql_output_target_list
+ 					{
+@@ -2806,6 +2832,7 @@
+ 			| RevokeStmt
+ 			| RevokeRoleStmt
+ 			| MergeStmt
++			| tsql_MergeOutputStmt
+ 			| RuleStmt
+ 			| SecLabelStmt
+ 			| SelectStmt
+--- a/contrib/babelfishpg_tsql/src/backend_parser/gram-tsql-prologue.y.h
++++ b/contrib/babelfishpg_tsql/src/backend_parser/gram-tsql-prologue.y.h
+@@ -92,6 +92,7 @@
+ 
+ char	   *construct_unique_index_name(char *index_name, char *relation_name);
+ 
++static void tsql_merge_output_to_returning(ReturningClause *returning);
+ static Node *tsql_update_delete_stmt_with_join(Node *n, List *from_clause, Node *where_clause, Node *top_clause, RangeVar *relation,
+ 											   core_yyscan_t yyscanner);
+ static void tsql_reset_update_delete_globals(void);
+--- a/contrib/babelfishpg_tsql/src/backend_parser/gram-tsql-epilogue.y.c
++++ b/contrib/babelfishpg_tsql/src/backend_parser/gram-tsql-epilogue.y.c
+@@ -1035,6 +1035,48 @@
+ 			|| (l->catalogname && r->relation->catalogname && \
+ 			strcmp(l->catalogname, r->relation->catalogname) == 0)))
+ 
++/*
++ * Raw-tree walker that renames the T-SQL pseudo-tables in a MERGE ... OUTPUT list:
++ *   inserted.<col> => new.<col>   (NULL for a row removed by a DELETE action)
++ *   deleted.<col>  => old.<col>   (NULL for a row created by an INSERT action)
++ * PostgreSQL 18 resolves new / old in a MERGE ... RETURNING list. Source columns such as
++ * i._Position are valid in RETURNING as written. $action has already been rewritten to
++ * merge_action() by the ANTLR layer.
++ */
++static bool
++tsql_merge_output_rename_walker(Node *node, void *context)
++{
++	if (node == NULL)
++		return false;
++
++	if (IsA(node, ColumnRef))
++	{
++		ColumnRef  *cref = (ColumnRef *) node;
++
++		if (list_length(cref->fields) >= 2 && IsA(linitial(cref->fields), String))
++		{
++			char	   *qualifier = strVal(linitial(cref->fields));
++
++			if (pg_strcasecmp(qualifier, "inserted") == 0)
++				linitial(cref->fields) = makeString(pstrdup("new"));
++			else if (pg_strcasecmp(qualifier, "deleted") == 0)
++				linitial(cref->fields) = makeString(pstrdup("old"));
++		}
++		return false;
++	}
++
++	return raw_expression_tree_walker(node, tsql_merge_output_rename_walker, context);
++}
++
++static void
++tsql_merge_output_to_returning(ReturningClause *returning)
++{
++	ListCell   *lc;
++
++	foreach(lc, returning->exprs)
++		(void) tsql_merge_output_rename_walker((Node *) lfirst(lc), NULL);
++}
++
+ static Node *
+ tsql_update_delete_stmt_with_join(Node *n, List *from_clause, Node *where_clause, Node *top_clause,
+ 								  RangeVar *relation, core_yyscan_t yyscanner)
