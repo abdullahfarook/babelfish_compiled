@@ -3,7 +3,7 @@
 
 Needs a running Babelfish with babelfishpg_tsql.enable_tsql_merge = on and pymssql:
 
-    bflocaldb create merge -s            # pg0-babelfish enables the setting by default
+    localdb create merge -s            # pg0-babelfish enables the setting by default
     pip install pymssql
     python3 merge_output_test.py [host:port] [user] [password]
 
